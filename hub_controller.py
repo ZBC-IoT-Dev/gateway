@@ -234,8 +234,18 @@ def sync_known_devices_from_cloud():
 
 def forward_device_data(payload: Dict[str, Any]):
     url = _api_url("/devices")
+    identifier = str(
+        payload.get("id")
+        or payload.get("identifier")
+        or payload.get("deviceId")
+        or ""
+    ).strip()
+    if not identifier:
+        logger.warning("Skipping device forward: missing identifier in payload")
+        return False
+
     api_payload = {
-        "identifier": payload.get("id"),
+        "identifier": identifier,
         "type": payload.get("type", "unknown"),
         "data": payload,
         "gatewayIdentifier": device_identifier,
@@ -679,6 +689,10 @@ def on_mqtt_message(client, userdata, msg):
         device_id = mark_device_seen(payload, fallback_identifier=fallback_id)
         if not device_id:
             return
+
+        # Ensure cloud payload always carries canonical identifier from topic fallback.
+        if not str(payload.get("id", "")).strip():
+            payload["id"] = device_id
 
         if config.get("provisioned"):
             enqueue_payload(payload)
