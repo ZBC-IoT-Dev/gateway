@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -9,6 +11,9 @@ import sys
 import time
 import uuid
 from collections import deque
+from datetime import datetime
+import shutil
+from urllib.parse import parse_qs, urlencode, urlparse
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 try:
@@ -39,6 +44,9 @@ DEFAULT_CONFIG = {
     "api_url": "http://169.254.13.52:3211/api",
     "mqtt_broker": "localhost",
     "mqtt_port": 1883,
+    "mqtt_debug_enabled": False,
+    "mqtt_debug_topics": ["devices/#", "discovery/#"],
+    "mqtt_debug_max_payload_chars": 320,
     "device_name": "Gateway_Pi",
     "provisioned": False,
     # Cloud command polling
@@ -46,11 +54,18 @@ DEFAULT_CONFIG = {
     "commands_poll_interval_sec": 3,
     "commands_path": "/gateways/commands",
     "commands_ack_path": "/gateways/commands/ack",
+    # Shared secret used to sign gateway->cloud HTTP API requests.
+    "gateway_shared_secret": "",
     # Local realtime control
     "websocket_enabled": True,
     "websocket_host": "0.0.0.0",
     "websocket_port": 8765,
     "websocket_path": "/ws",
+    # Optional token required for websocket control clients.
+    "websocket_auth_token": "",
+    # Local terminal dashboard
+    "tui_enabled": True,
+    "tui_refresh_sec": 1.0,
 }
 
 # BLE CONSTANTS
@@ -77,6 +92,24 @@ processed_command_set: Set[str] = set()
 
 # If ack endpoint is missing in API, disable noisy repeated errors
 command_ack_supported: Optional[bool] = None
+gateway_start_time = time.time()
+gateway_stats: Dict[str, Any] = {
+    "received_messages": 0,
+    "queued_messages": 0,
+    "forwarded_messages": 0,
+    "failed_forwards": 0,
+    "last_forward_ok_at": 0.0,
+    "last_forward_err_at": 0.0,
+    "last_forward_error": "",
+    "last_heartbeat_at": 0.0,
+    "last_sync_at": 0.0,
+    "last_command_poll_at": 0.0,
+    "mqtt_debug_messages": 0,
+}
+recent_events: Deque[str] = deque(maxlen=16)
+queue_retry_backoff_until = 0.0
+queue_retry_failures = 0
+tui_active = False
 
 
 def print_banner():
@@ -117,12 +150,60 @@ def _api_url(path: str) -> str:
     return f"{base}{path}"
 
 
+def _build_signed_headers(method: str, path_with_query: str, body_text: str = "") -> Dict[str, str]:
+    secret = str(config.get("gateway_shared_secret", "")).strip()
+    if not secret:
+        raise RuntimeError(
+            "Missing gateway_shared_secret in config (or GATEWAY_SHARED_SECRET env var)"
+        )
+
+    timestamp = str(int(time.time()))
+    canonical = f"{method.upper()}\n{path_with_query}\n{timestamp}\n{body_text}"
+    signature = hmac.new(
+        secret.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return {
+        "X-Gateway-Timestamp": timestamp,
+        "X-Gateway-Signature": signature,
+    }
+
+
+def _gateway_get(path: str, params: Optional[Dict[str, Any]] = None, timeout: int = 10):
+    url = _api_url(path)
+    parsed = urlparse(url)
+    query = ""
+    if params:
+        query = urlencode(sorted(params.items()), doseq=True)
+    path_with_query = f"{parsed.path}?{query}" if query else parsed.path
+    headers = _build_signed_headers("GET", path_with_query, "")
+    return requests.get(url, params=params, headers=headers, timeout=timeout)
+
+
+def _gateway_post(path: str, payload: Dict[str, Any], timeout: int = 10):
+    url = _api_url(path)
+    parsed = urlparse(url)
+    body_text = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    headers = {
+        "Content-Type": "application/json",
+        **_build_signed_headers("POST", parsed.path, body_text),
+    }
+    return requests.post(url, data=body_text, headers=headers, timeout=timeout)
+
+
 def load_config():
     global config
     config = _load_json(CONFIG_FILE, DEFAULT_CONFIG.copy())
     for k, v in DEFAULT_CONFIG.items():
         if k not in config:
             config[k] = v
+    if not str(config.get("gateway_shared_secret", "")).strip():
+        config["gateway_shared_secret"] = os.getenv("GATEWAY_SHARED_SECRET", "")
+    if not str(config.get("websocket_auth_token", "")).strip():
+        config["websocket_auth_token"] = os.getenv("HUB_WS_TOKEN", "")
+    if os.getenv("MQTT_DEBUG", "").strip().lower() in ("1", "true", "yes", "on"):
+        config["mqtt_debug_enabled"] = True
 
 
 def save_config():
@@ -133,6 +214,7 @@ def load_state():
     global known_devices, pending_queue
     known_devices = _load_json(KNOWN_DEVICES_FILE, {})
     pending_queue = _load_json(PENDING_QUEUE_FILE, [])
+    _normalize_pending_queue_entries()
 
 
 def save_known_devices():
@@ -141,6 +223,255 @@ def save_known_devices():
 
 def save_pending_queue():
     _save_json(PENDING_QUEUE_FILE, pending_queue)
+
+
+def _extract_source_timestamp_ms(payload: Dict[str, Any]) -> int:
+    candidates = [
+        payload.get("timestamp"),
+        payload.get("ts"),
+        payload.get("time"),
+        payload.get("sentAt"),
+        payload.get("createdAt"),
+    ]
+    for value in candidates:
+        try:
+            if value is None:
+                continue
+            numeric = float(value)
+            if numeric <= 0:
+                continue
+            # Accept both seconds and milliseconds.
+            if numeric < 10_000_000_000:
+                numeric *= 1000
+            return int(numeric)
+        except Exception:
+            continue
+    return int(time.time() * 1000)
+
+
+def _make_queue_entry(payload: Dict[str, Any]) -> Dict[str, Any]:
+    now_ms = int(time.time() * 1000)
+    return {
+        "payload": payload,
+        "receivedAtMs": now_ms,
+        "sourceTimestampMs": _extract_source_timestamp_ms(payload),
+        "attempts": 0,
+    }
+
+
+def _normalize_pending_queue_entries():
+    global pending_queue
+    normalized: List[Dict[str, Any]] = []
+    changed = False
+    for row in pending_queue:
+        if isinstance(row, dict) and isinstance(row.get("payload"), dict):
+            try:
+                received_at_ms = int(row.get("receivedAtMs", int(time.time() * 1000)))
+            except Exception:
+                received_at_ms = int(time.time() * 1000)
+                changed = True
+            try:
+                source_ts_ms = int(
+                    row.get(
+                        "sourceTimestampMs",
+                        _extract_source_timestamp_ms(row.get("payload", {})),
+                    )
+                )
+            except Exception:
+                source_ts_ms = _extract_source_timestamp_ms(row.get("payload", {}))
+                changed = True
+            try:
+                attempts = int(row.get("attempts", 0))
+            except Exception:
+                attempts = 0
+                changed = True
+            entry = {
+                "payload": row.get("payload", {}),
+                "receivedAtMs": received_at_ms,
+                "sourceTimestampMs": source_ts_ms,
+                "attempts": attempts,
+            }
+            normalized.append(entry)
+            continue
+
+        if isinstance(row, dict):
+            normalized.append(_make_queue_entry(row))
+            changed = True
+            continue
+
+        changed = True
+    pending_queue = normalized
+    if changed:
+        save_pending_queue()
+
+
+def _clear_screen():
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
+def _format_time(ts: float) -> str:
+    if not ts:
+        return "-"
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+
+def _record_event(message: str):
+    stamped = f"{datetime.now().strftime('%H:%M:%S')} | {message}"
+    recent_events.appendleft(stamped)
+
+
+def _is_mqtt_debug_enabled() -> bool:
+    return bool(config.get("mqtt_debug_enabled", False))
+
+
+def _payload_preview(text: str) -> str:
+    max_chars = int(config.get("mqtt_debug_max_payload_chars", 320))
+    max_chars = max(40, min(max_chars, 2000))
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}...(truncated {len(text) - max_chars} chars)"
+
+
+def _mqtt_debug(direction: str, topic: str, payload_text: str):
+    if not _is_mqtt_debug_enabled():
+        return
+    preview = _payload_preview(payload_text)
+    gateway_stats["mqtt_debug_messages"] += 1
+    logger.info("[MQTT DEBUG] %s topic=%s payload=%s", direction, topic, preview)
+    _record_event(f"[MQTT {direction}] {topic} -> {preview}")
+
+
+def _term_width() -> int:
+    try:
+        return max(80, shutil.get_terminal_size(fallback=(100, 30)).columns)
+    except Exception:
+        return 100
+
+
+def _fit(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text + (" " * (width - len(text)))
+    if width <= 3:
+        return text[:width]
+    return text[: width - 3] + "..."
+
+
+def _bool_chip(value: bool, good: str = "ON", bad: str = "OFF") -> str:
+    return good if value else bad
+
+
+def _metric_bar(value: int, max_value: int, width: int = 20) -> str:
+    if max_value <= 0:
+        max_value = 1
+    width = max(6, width)
+    clamped = max(0.0, min(1.0, value / max_value))
+    fill = int(round(clamped * width))
+    return "[" + ("#" * fill) + ("-" * (width - fill)) + "]"
+
+
+def _render_dashboard_lines() -> List[str]:
+    width = _term_width()
+    inner = max(40, width - 2)
+    up_seconds = max(0, int(time.time() - gateway_start_time))
+    uptime = f"{up_seconds // 3600:02d}:{(up_seconds % 3600) // 60:02d}:{up_seconds % 60:02d}"
+    mqtt_ok = bool(mqtt_client and mqtt_client.is_connected())
+    queued = len(pending_queue)
+    backoff_left = max(0, int(queue_retry_backoff_until - time.time()))
+    ws_clients = len(websocket_clients)
+    mqtt_debug = _is_mqtt_debug_enabled()
+
+    title = "GATEWAY CONTROL CENTER"
+    lines = [
+        "╔" + ("═" * inner) + "╗",
+        "║" + _fit(title.center(inner), inner) + "║",
+        "╠" + ("═" * inner) + "╣",
+        "║" + _fit(
+            f"Device: {config.get('device_name', 'Gateway_Pi')}   ID: {device_identifier}   Uptime: {uptime}",
+            inner,
+        ) + "║",
+        "║" + _fit(
+            f"Provisioned: {_bool_chip(bool(config.get('provisioned')), 'YES', 'NO')}   MQTT: {_bool_chip(mqtt_ok)}   WS Clients: {ws_clients}",
+            inner,
+        ) + "║",
+        "║" + _fit(
+            f"MQTT Debug: {_bool_chip(mqtt_debug)}   Debug Msgs: {gateway_stats['mqtt_debug_messages']}   Known Devices: {len(known_devices)}",
+            inner,
+        ) + "║",
+        "║" + _fit(
+            f"Queue: {queued} { _metric_bar(queued, 1000, 18) }   Backoff: {backoff_left}s",
+            inner,
+        ) + "║",
+        "╠" + ("─" * inner) + "╣",
+        "║" + _fit("Traffic", inner) + "║",
+        "║" + _fit(
+            f"Rx: {gateway_stats['received_messages']}   Enqueued: {gateway_stats['queued_messages']}   Tx: {gateway_stats['forwarded_messages']}   Fail: {gateway_stats['failed_forwards']}",
+            inner,
+        ) + "║",
+        "║" + _fit(
+            f"Last OK: {_format_time(gateway_stats['last_forward_ok_at'])}   Last Error: {_format_time(gateway_stats['last_forward_err_at'])}",
+            inner,
+        ) + "║",
+        "║" + _fit(f"Error: {gateway_stats['last_forward_error'] or '-'}", inner) + "║",
+        "╠" + ("─" * inner) + "╣",
+        "║" + _fit("Schedulers", inner) + "║",
+        "║" + _fit(
+            f"Heartbeat: {_format_time(gateway_stats['last_heartbeat_at'])}   Sync: {_format_time(gateway_stats['last_sync_at'])}   Cmd Poll: {_format_time(gateway_stats['last_command_poll_at'])}",
+            inner,
+        ) + "║",
+        "╠" + ("─" * inner) + "╣",
+        "║" + _fit("Recent Events", inner) + "║",
+    ]
+    if recent_events:
+        for event in list(recent_events)[:10]:
+            lines.append("║" + _fit(event, inner) + "║")
+    else:
+        lines.append("║" + _fit("-", inner) + "║")
+    lines.append("╠" + ("─" * inner) + "╣")
+    lines.append("║" + _fit("Ctrl+C quit | --configure wizard | --mqtt-debug trace", inner) + "║")
+    lines.append("╚" + ("═" * inner) + "╝")
+    return lines
+
+
+def _enter_tui_mode():
+    global tui_active
+    if tui_active:
+        return
+    # Alternate buffer + hide cursor for smooth redraw.
+    sys.stdout.write("\033[?1049h\033[?25l\033[H")
+    sys.stdout.flush()
+    tui_active = True
+
+
+def _exit_tui_mode():
+    global tui_active
+    if not tui_active:
+        return
+    # Show cursor + leave alternate buffer.
+    sys.stdout.write("\033[?25h\033[?1049l")
+    sys.stdout.flush()
+    tui_active = False
+
+
+def _draw_tui_frame(lines: List[str]):
+    sys.stdout.write("\033[H")
+    sys.stdout.write("\n".join(lines))
+    sys.stdout.write("\033[J")
+    sys.stdout.flush()
+
+
+async def run_tui_dashboard():
+    refresh = float(config.get("tui_refresh_sec", 1.0))
+    refresh = max(0.3, min(refresh, 5.0))
+    _enter_tui_mode()
+    try:
+        while True:
+            _draw_tui_frame(_render_dashboard_lines())
+            await asyncio.sleep(refresh)
+    finally:
+        _exit_tui_mode()
 
 
 # === WIFI UTILS ===
@@ -169,39 +500,40 @@ def check_internet():
 
 # === API UTILS ===
 def register_gateway():
-    url = _api_url("/gateways/register")
     payload = {
         "inviteCode": config["inviteCode"],
         "identifier": device_identifier,
         "name": config["device_name"],
         "type": "raspberry_pi_4",
     }
-    logger.info("Registering with: %s", url)
+    logger.info("Registering with: %s", _api_url("/gateways/register"))
     try:
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = _gateway_post("/gateways/register", payload, timeout=10)
         if resp.status_code in (200, 201):
             logger.info("Gateway registered successfully")
+            _record_event("Gateway registered")
             return True
         logger.error("Registration failed (%s): %s", resp.status_code, resp.text)
+        _record_event(f"Register failed ({resp.status_code})")
         return False
     except Exception as e:
         logger.error("Register API error: %s", e)
+        _record_event(f"Register error: {e}")
         return False
 
 
 def send_heartbeat():
-    url = _api_url("/gateways/heartbeat")
     try:
-        requests.post(url, json={"identifier": device_identifier}, timeout=5)
+        _gateway_post("/gateways/heartbeat", {"identifier": device_identifier}, timeout=5)
+        gateway_stats["last_heartbeat_at"] = time.time()
     except Exception as e:
         logger.error("Heartbeat failed: %s", e)
 
 
 def sync_known_devices_from_cloud():
-    url = _api_url("/gateways/devices")
     try:
-        resp = requests.get(
-            url,
+        resp = _gateway_get(
+            "/gateways/devices",
             params={"gatewayIdentifier": device_identifier},
             timeout=10,
         )
@@ -228,12 +560,18 @@ def sync_known_devices_from_cloud():
         if changed:
             save_known_devices()
             logger.info("Synced %d known devices from cloud", len(rows))
+            _record_event(f"Synced {len(rows)} devices from cloud")
+        gateway_stats["last_sync_at"] = time.time()
     except Exception as e:
         logger.error("Cloud device sync error: %s", e)
 
 
-def forward_device_data(payload: Dict[str, Any]):
-    url = _api_url("/devices")
+def forward_device_data(queue_entry: Dict[str, Any]):
+    payload = queue_entry.get("payload", {})
+    if not isinstance(payload, dict):
+        logger.warning("Skipping device forward: invalid payload envelope")
+        return False
+
     identifier = str(
         payload.get("id")
         or payload.get("identifier")
@@ -247,22 +585,40 @@ def forward_device_data(payload: Dict[str, Any]):
     api_payload = {
         "identifier": identifier,
         "type": payload.get("type", "unknown"),
-        "data": payload,
+        "data": {
+            **payload,
+            "__gateway": {
+                "receivedAtMs": int(queue_entry.get("receivedAtMs", int(time.time() * 1000))),
+                "sourceTimestampMs": int(
+                    queue_entry.get(
+                        "sourceTimestampMs",
+                        _extract_source_timestamp_ms(payload),
+                    )
+                ),
+                "forwardedAtMs": int(time.time() * 1000),
+                "attempts": int(queue_entry.get("attempts", 0)),
+            },
+        },
         "gatewayIdentifier": device_identifier,
     }
-    resp = requests.post(url, json=api_payload, timeout=6)
+    resp = _gateway_post("/devices", api_payload, timeout=6)
     return resp.status_code in (200, 201)
 
 
 def enqueue_payload(payload: Dict[str, Any]):
-    pending_queue.append(payload)
+    pending_queue.append(_make_queue_entry(payload))
+    gateway_stats["queued_messages"] += 1
     if len(pending_queue) > 1000:
         del pending_queue[0 : len(pending_queue) - 1000]
+        _record_event("Queue trimmed to 1000 entries")
     save_pending_queue()
 
 
 def flush_pending_queue(max_items: int = 25):
+    global queue_retry_backoff_until, queue_retry_failures
     if not pending_queue or not config.get("provisioned"):
+        return
+    if time.time() < queue_retry_backoff_until:
         return
 
     sent = 0
@@ -272,14 +628,40 @@ def flush_pending_queue(max_items: int = 25):
             if forward_device_data(candidate):
                 pending_queue.pop(0)
                 sent += 1
+                queue_retry_failures = 0
+                queue_retry_backoff_until = 0.0
+                gateway_stats["forwarded_messages"] += 1
+                gateway_stats["last_forward_ok_at"] = time.time()
+                gateway_stats["last_forward_error"] = ""
             else:
+                queue_retry_failures += 1
+                wait_seconds = min(60.0, float(2 ** min(queue_retry_failures, 6)))
+                queue_retry_backoff_until = time.time() + wait_seconds
+                gateway_stats["failed_forwards"] += 1
+                gateway_stats["last_forward_err_at"] = time.time()
+                gateway_stats["last_forward_error"] = "Cloud rejected payload"
+                if isinstance(candidate, dict):
+                    candidate["attempts"] = int(candidate.get("attempts", 0)) + 1
+                _record_event(f"Forward failed. Backoff {int(wait_seconds)}s")
                 break
-        except Exception:
+        except Exception as e:
+            queue_retry_failures += 1
+            wait_seconds = min(60.0, float(2 ** min(queue_retry_failures, 6)))
+            queue_retry_backoff_until = time.time() + wait_seconds
+            gateway_stats["failed_forwards"] += 1
+            gateway_stats["last_forward_err_at"] = time.time()
+            gateway_stats["last_forward_error"] = str(e)
+            if isinstance(candidate, dict):
+                candidate["attempts"] = int(candidate.get("attempts", 0)) + 1
+            _record_event(f"Forward error: {e}")
             break
 
     if sent > 0:
         save_pending_queue()
         logger.info("Flushed %d queued payload(s)", sent)
+        _record_event(f"Flushed {sent} queued payload(s)")
+    elif pending_queue:
+        save_pending_queue()
 
 
 def mark_device_seen(payload: Dict[str, Any], fallback_identifier: str = ""):
@@ -366,8 +748,10 @@ def _publish_command_to_device(device_id: str, command_payload: Any) -> Tuple[bo
         payload = json.dumps({"state": "OFF"})
 
     try:
+        _mqtt_debug("OUT", topic, payload)
         info = mqtt_client.publish(topic, payload, qos=1, retain=False)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            _record_event(f"MQTT publish rc={info.rc} topic={topic}")
             return False, f"mqtt_publish_error_{info.rc}"
 
         # wait_for_publish exists in paho message info
@@ -525,7 +909,9 @@ async def _handle_websocket_message(websocket: Any, raw_message: Any):
 async def _handle_websocket_connection(websocket: Any, path: Optional[str] = None):
     expected_path = str(config.get("websocket_path", "/ws"))
     current_path = str(path or getattr(websocket, "path", "") or "")
-    if expected_path and current_path and current_path != expected_path:
+    parsed_ws_path = urlparse(current_path)
+    normalized_path = parsed_ws_path.path if parsed_ws_path.path else current_path
+    if expected_path and normalized_path and normalized_path != expected_path:
         await websocket.send(
             json.dumps(
                 {
@@ -538,7 +924,17 @@ async def _handle_websocket_connection(websocket: Any, path: Optional[str] = Non
         await websocket.close(code=1008, reason="Invalid websocket path")
         return
 
+    expected_token = str(config.get("websocket_auth_token", "")).strip()
+    if expected_token:
+        query = parse_qs(parsed_ws_path.query)
+        provided_token = str((query.get("token") or [""])[0]).strip()
+        if provided_token != expected_token:
+            await websocket.close(code=1008, reason="Unauthorized websocket client")
+            _record_event("Rejected websocket client (bad token)")
+            return
+
     websocket_clients.add(websocket)
+    _record_event(f"WebSocket client connected ({len(websocket_clients)})")
     await websocket.send(
         json.dumps(
             {
@@ -558,6 +954,7 @@ async def _handle_websocket_connection(websocket: Any, path: Optional[str] = Non
         logger.warning("WebSocket client error: %s", e)
     finally:
         websocket_clients.discard(websocket)
+        _record_event(f"WebSocket client disconnected ({len(websocket_clients)})")
 
 
 async def run_websocket_server():
@@ -577,6 +974,8 @@ async def run_websocket_server():
         ping_timeout=20,
         max_size=1024 * 1024,
     )
+    if not str(config.get("websocket_auth_token", "")).strip():
+        logger.warning("WebSocket auth token not configured. Control channel is open to LAN clients.")
     logger.info("WebSocket control active at ws://%s:%d%s", host, port, path)
     await ws_server.wait_closed()
 
@@ -589,7 +988,7 @@ def _ack_command(command_id: str, device_id: str, success: bool, error: str = ""
     if command_ack_supported is False:
         return
 
-    url = _api_url(str(config.get("commands_ack_path", "/gateways/commands/ack")))
+    ack_path = str(config.get("commands_ack_path", "/gateways/commands/ack"))
     payload = {
         "commandId": command_id,
         "gatewayIdentifier": device_identifier,
@@ -600,13 +999,13 @@ def _ack_command(command_id: str, device_id: str, success: bool, error: str = ""
     }
 
     try:
-        resp = requests.post(url, json=payload, timeout=6)
+        resp = _gateway_post(ack_path, payload, timeout=6)
         if resp.status_code in (200, 201, 204):
             command_ack_supported = True
             return
         if resp.status_code == 404:
             command_ack_supported = False
-            logger.warning("Command ACK endpoint not found: %s (disabled)", url)
+            logger.warning("Command ACK endpoint not found: %s (disabled)", _api_url(ack_path))
             return
         logger.warning("Command ACK failed (%s): %s", resp.status_code, resp.text)
     except Exception as e:
@@ -620,16 +1019,16 @@ def poll_and_dispatch_commands():
         return
 
     path = str(config.get("commands_path", "/gateways/commands"))
-    url = _api_url(path)
+    gateway_stats["last_command_poll_at"] = time.time()
 
     try:
-        resp = requests.get(
-            url,
+        resp = _gateway_get(
+            path,
             params={"gatewayIdentifier": device_identifier},
             timeout=8,
         )
         if resp.status_code == 404:
-            logger.debug("Commands endpoint not found: %s", url)
+            logger.debug("Commands endpoint not found: %s", _api_url(path))
             return
         if resp.status_code != 200:
             logger.warning("Command poll failed (%s): %s", resp.status_code, resp.text)
@@ -655,6 +1054,10 @@ def poll_and_dispatch_commands():
             if command_id:
                 _ack_command(command_id, device_id, ok, err)
                 _remember_command_id(command_id)
+            if ok:
+                _record_event(f"Command -> {device_id}")
+            else:
+                _record_event(f"Command failed -> {device_id}: {err}")
 
     except Exception as e:
         logger.error("Command polling error: %s", e)
@@ -664,17 +1067,31 @@ def poll_and_dispatch_commands():
 def on_mqtt_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         logger.info("MQTT connected")
+        _record_event("MQTT connected")
         client.subscribe("discovery/announce")
         client.subscribe("devices/+/state")
+        if _is_mqtt_debug_enabled():
+            topics = config.get("mqtt_debug_topics", ["devices/#", "discovery/#"])
+            if not isinstance(topics, list):
+                topics = ["devices/#", "discovery/#"]
+            for topic in topics:
+                t = str(topic).strip()
+                if not t:
+                    continue
+                client.subscribe(t)
+            _record_event(f"MQTT debug subscriptions active ({len(topics)} topic patterns)")
         sync_known_devices_from_cloud()
         flush_pending_queue()
     else:
         logger.error("MQTT connection failed: %s", rc)
+        _record_event(f"MQTT connect failed: {rc}")
 
 
 def on_mqtt_message(client, userdata, msg):
     try:
+        gateway_stats["received_messages"] += 1
         text = msg.payload.decode("utf-8")
+        _mqtt_debug("IN", str(msg.topic), text)
         fallback_id = _extract_device_id_from_topic(msg.topic)
 
         payload: Dict[str, Any]
@@ -699,6 +1116,7 @@ def on_mqtt_message(client, userdata, msg):
             flush_pending_queue(max_items=5)
         else:
             logger.debug("Gateway not provisioned. Cached device %s locally.", device_id)
+            _record_event(f"Cached device update (not provisioned): {device_id}")
 
         _schedule_websocket_event(
             {
@@ -733,6 +1151,10 @@ async def run_ble_provisioning(loop):
                 config["inviteCode"] = data["inviteCode"]
             if "api_url" in data:
                 config["api_url"] = data["api_url"]
+            if "gateway_shared_secret" in data:
+                config["gateway_shared_secret"] = data["gateway_shared_secret"]
+            if "websocket_auth_token" in data:
+                config["websocket_auth_token"] = data["websocket_auth_token"]
 
             wifi_success = True
             if data.get("ssid"):
@@ -787,15 +1209,62 @@ def setup_wizard():
     if api_url:
         config["api_url"] = api_url
 
+    default_mqtt_broker = str(config.get("mqtt_broker", "localhost"))
+    mqtt_broker = input(f"MQTT Broker [{default_mqtt_broker}]: ").strip()
+    if mqtt_broker:
+        config["mqtt_broker"] = mqtt_broker
+
+    default_mqtt_port = int(config.get("mqtt_port", 1883))
+    mqtt_port = input(f"MQTT Port [{default_mqtt_port}]: ").strip()
+    if mqtt_port:
+        try:
+            config["mqtt_port"] = int(mqtt_port)
+        except ValueError:
+            logger.warning("Invalid MQTT port input. Keeping %s", default_mqtt_port)
+
+    mqtt_debug_default = "Y" if config.get("mqtt_debug_enabled", False) else "n"
+    mqtt_debug_input = input(f"Enable MQTT debug tracing? [{mqtt_debug_default}/n]: ").strip().lower()
+    config["mqtt_debug_enabled"] = mqtt_debug_input in ("y", "yes")
+
+    default_debug_topics = ",".join(
+        [str(x) for x in config.get("mqtt_debug_topics", ["devices/#", "discovery/#"])]
+    )
+    debug_topics_input = input(
+        f"MQTT debug topic patterns comma-separated [{default_debug_topics}]: "
+    ).strip()
+    if debug_topics_input:
+        config["mqtt_debug_topics"] = [
+            t.strip() for t in debug_topics_input.split(",") if t.strip()
+        ]
+
     invite = input("Invite Code (optional): ").strip()
     if invite:
         config["inviteCode"] = invite
 
+    default_gateway_secret = str(config.get("gateway_shared_secret", "")).strip()
+    gateway_secret = input(
+        f"Gateway Shared Secret [{default_gateway_secret or 'required'}]: "
+    ).strip()
+    if gateway_secret:
+        config["gateway_shared_secret"] = gateway_secret
+
+    default_ws_token = str(config.get("websocket_auth_token", "")).strip()
+    ws_token = input(
+        f"WebSocket Auth Token [{default_ws_token or 'optional'}]: "
+    ).strip()
+    if ws_token:
+        config["websocket_auth_token"] = ws_token
+
     commands_enabled_input = input("Enable cloud commands? [Y/n]: ").strip().lower()
     config["commands_enabled"] = commands_enabled_input not in ("n", "no")
 
+    tui_enabled_default = "Y" if config.get("tui_enabled", True) else "n"
+    tui_enabled_input = input(f"Enable live TUI dashboard? [{tui_enabled_default}/n]: ").strip().lower()
+    config["tui_enabled"] = tui_enabled_input not in ("n", "no")
+
     config["provisioned"] = False
     save_config()
+    _record_event("Setup wizard updated configuration")
 
 
 async def main_loop():
@@ -805,11 +1274,31 @@ async def main_loop():
         action="store_true",
         help="Reset configuration and run setup wizard",
     )
+    parser.add_argument(
+        "--configure",
+        action="store_true",
+        help="Run setup wizard and exit",
+    )
+    parser.add_argument(
+        "--mqtt-debug",
+        action="store_true",
+        help="Enable verbose MQTT debug tracing for this run",
+    )
+    parser.add_argument(
+        "--no-mqtt-debug",
+        action="store_true",
+        help="Disable MQTT debug tracing for this run",
+    )
     args = parser.parse_args()
 
-    print_banner()
+    _clear_screen()
     load_config()
+    if args.mqtt_debug:
+        config["mqtt_debug_enabled"] = True
+    if args.no_mqtt_debug:
+        config["mqtt_debug_enabled"] = False
     load_state()
+    _record_event("Gateway process started")
     global main_event_loop
     main_event_loop = asyncio.get_running_loop()
 
@@ -817,6 +1306,12 @@ async def main_loop():
         if args.reset:
             print("Resetting configuration...")
         setup_wizard()
+    elif args.configure:
+        setup_wizard()
+        return
+
+    if not config.get("tui_enabled", True):
+        print_banner()
 
     if config.get("provisioned"):
         register_gateway()
@@ -836,6 +1331,8 @@ async def main_loop():
 
     asyncio.create_task(run_ble_provisioning(asyncio.get_running_loop()))
     asyncio.create_task(run_websocket_server())
+    if config.get("tui_enabled", True) and sys.stdout.isatty():
+        asyncio.create_task(run_tui_dashboard())
 
     last_heartbeat_at = 0.0
     last_sync_at = 0.0
